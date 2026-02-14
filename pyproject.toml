@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Vision-Language Assistant model implementation"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "Your Name", email = "your.email@example.com"}
 ]
@@ -17,7 +17,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -29,6 +28,7 @@ dependencies = [
     "torch>=2.0.0",
     "torchvision>=0.15.0",
     "transformers>=4.30.0",
+    "datasets>=4.0.0",
     "numpy>=1.24.0",
     "pillow>=10.0.0",
     "tqdm>=4.65.0",
@@ -54,11 +54,9 @@ Repository = "https://github.com/yourusername/halo-vla.git"
 Documentation = "https://halo-vla.readthedocs.io"
 Issues = "https://github.com/yourusername/halo-vla/issues"
 
-[tool.setuptools]
-packages = ["models"]
-
-[tool.setuptools.package-data]
-models = ["*.py"]
+[tool.setuptools.packages.find]
+where = [".", "src"]
+include = ["config*", "dataloader*", "Halo_VLA*", "Halo_VLA.models*", "tests*", "scripts*"]
 
 [tool.black]
 line-length = 100

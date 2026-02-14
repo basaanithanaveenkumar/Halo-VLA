@@ -109,22 +109,32 @@ class MultiHeadAttn(nn.Module):
         return output
 
 class TransformerBlock(nn.Module):
-    def __init__(self, emb_dim=256, num_heads=8, mlp_dim=512, drop_fact=0.0,causal_mask=False):
+    def __init__(self, emb_dim=256, num_heads=8, mlp_dim=512, drop_fact=0.0,
+                 causal_mask=False, use_moe=True, moe_hid_scale=1.2,
+                 moe_num_routed_experts=16, moe_top_k=4,
+                 moe_num_shared_experts=2):
         super().__init__()
         self.attn = MultiHeadAttn(emb_dim=emb_dim,num_heads=num_heads,drop_fact=drop_fact,causal_mask=causal_mask)
         # after input
         self.norm1 = nn.LayerNorm(emb_dim)
         
-        # TODO Need to use the 4 * emb dim
-        # self.mlp = nn.Sequential(
-        #     nn.Linear(emb_dim, mlp_dim),
-        #     nn.GELU(),
-        #     nn.Linear(mlp_dim, emb_dim),
-        #     nn.Dropout(drop_fact)
-        # )
-        # TODO need to get this from config
-        self.hid_dim = round(emb_dim * 1.2) # for expansion and contraction
-        self.moe = DeepseekMoE(emb_dim,self.hid_dim,num_router_exprts=16,best_k=4,num_shared_exprts=2)
+        # Feed-forward: MoE or standard MLP
+        self.use_moe = use_moe
+        if use_moe:
+            moe_hid_dim = round(emb_dim * moe_hid_scale)
+            self.ffn = DeepseekMoE(
+                emb_dim, moe_hid_dim,
+                num_router_exprts=moe_num_routed_experts,
+                best_k=moe_top_k,
+                num_shared_exprts=moe_num_shared_experts,
+            )
+        else:
+            self.ffn = nn.Sequential(
+                nn.Linear(emb_dim, mlp_dim),
+                nn.GELU(),
+                nn.Linear(mlp_dim, emb_dim),
+                nn.Dropout(drop_fact),
+            )
         # before ffn
         self.norm2 = nn.LayerNorm(emb_dim)
         
@@ -133,17 +143,28 @@ class TransformerBlock(nn.Module):
         attn_output = self.attn(self.norm1(inputs))
         x = inputs + attn_output  # Residual connection
         
-        # Feed-forward block replaced for moe
-        mlp_output = self.moe(self.norm2(x))
-        output = x + mlp_output  # Residual connection
+        # Feed-forward block (MoE or MLP)
+        ffn_output = self.ffn(self.norm2(x))
+        output = x + ffn_output  # Residual connection
         
         return output
 
 class DecoderTransformer(nn.Module):
-    def __init__(self, num_layers=16, emb_dim=1024, num_heads=32, mlp_dim=512, drop_fact=0.0):
+    def __init__(self, num_layers=16, emb_dim=1024, num_heads=32, mlp_dim=512,
+                 drop_fact=0.0, use_moe=True, moe_hid_scale=1.2,
+                 moe_num_routed_experts=16, moe_top_k=4,
+                 moe_num_shared_experts=2):
         super().__init__()
         self.layers = nn.ModuleList([
-            TransformerBlock(emb_dim=emb_dim, num_heads=num_heads, mlp_dim=mlp_dim, drop_fact=drop_fact,causal_mask=True)
+            TransformerBlock(
+                emb_dim=emb_dim, num_heads=num_heads, mlp_dim=mlp_dim,
+                drop_fact=drop_fact, causal_mask=True,
+                use_moe=use_moe,
+                moe_hid_scale=moe_hid_scale,
+                moe_num_routed_experts=moe_num_routed_experts,
+                moe_top_k=moe_top_k,
+                moe_num_shared_experts=moe_num_shared_experts,
+            )
             for _ in range(num_layers)
         ])
         self.norm = nn.LayerNorm(emb_dim)

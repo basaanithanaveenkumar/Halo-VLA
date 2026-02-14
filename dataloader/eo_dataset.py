@@ -29,11 +29,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Image token placeholder used inside conversation text
 # ---------------------------------------------------------------------------
-IMAGE_TOKEN = "<image>"
-ACTION_TOKEN = "<action>"
-PAD_TOKEN = "<pad>"
-BOS_TOKEN = "<bos>"
-EOS_TOKEN = "<eos>"
+from config.tokens import SPECIAL_TOKENS, get_all_custom_tokens, get_token, get_token_id
+
+IMAGE_TOKEN = get_token("image_token")
+ACTION_TOKEN = get_token("action_token")
+STATE_TOKEN = get_token("state_token")
 
 # ---------------------------------------------------------------------------
 # All available subsets
@@ -77,8 +77,8 @@ class EODatasetConfig:
     img_size: int = 224
     max_seq_len: int = 512
     max_action_len: int = 64
-    action_dim: int = 7  # typical robot action dim (6-DOF + gripper)
-    state_dim: int = 7
+    action_dim: int = 32   # EO-Data uses 32-dim actions (varies by embodiment)
+    state_dim: int = 32
     max_images: int = 8  # max images per sample for interleaved data
     tokenizer_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
     streaming: bool = False
@@ -87,6 +87,7 @@ class EODatasetConfig:
     img_mean: Tuple[float, ...] = (0.485, 0.456, 0.406)
     img_std: Tuple[float, ...] = (0.229, 0.224, 0.225)
     # Conversation formatting
+    system_prefix: str = "<|im_start|>system\n"
     human_prefix: str = "<|im_start|>user\n"
     assistant_prefix: str = "<|im_start|>assistant\n"
     turn_end: str = "<|im_end|>\n"
@@ -96,6 +97,7 @@ class EODatasetConfig:
     eos_token_id: int = 2
     image_token_id: int = 3
     action_token_id: int = 4
+    state_token_id: int = 5
 
 
 # ---------------------------------------------------------------------------
@@ -164,10 +166,10 @@ class EODataset(Dataset):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Add special tokens for image / action placeholders if missing
+        # Add special tokens for image / action / state if missing
         special_tokens: Dict[str, str] = {}
         additional_special: List[str] = []
-        for tok in [IMAGE_TOKEN, ACTION_TOKEN]:
+        for tok in get_all_custom_tokens():
             if tok not in self.tokenizer.get_vocab():
                 additional_special.append(tok)
         if additional_special:
@@ -185,6 +187,7 @@ class EODataset(Dataset):
         self.cfg.eos_token_id = self.tokenizer.eos_token_id
         self.cfg.image_token_id = self.tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
         self.cfg.action_token_id = self.tokenizer.convert_tokens_to_ids(ACTION_TOKEN)
+        self.cfg.state_token_id = self.tokenizer.convert_tokens_to_ids(STATE_TOKEN)
 
     def _setup_transform(self):
         self.img_transform = build_image_transform(
@@ -243,7 +246,6 @@ class EODataset(Dataset):
             "states": states,                 # [T, state_dim]
             "state_mask": state_mask,          # [T]
             "num_images": images.size(0),
-            "source": sample.get("source", ""),
         }
 
     # ------------------------------------------------------------- images
@@ -319,6 +321,13 @@ class EODataset(Dataset):
 
         text_parts: List[str] = []
         role_is_assistant: List[bool] = []
+
+        # Prepend system prompt from config
+        from config import HaloVLMConfig
+        model_cfg = HaloVLMConfig()
+        system_msg = f"{self.cfg.system_prefix}{model_cfg.system_prompt}{self.cfg.turn_end}"
+        text_parts.append(system_msg)
+        role_is_assistant.append(False)  # mask system turn from loss
 
         for turn in conversation:
             role = turn.get("from", turn.get("role", "human")).lower()
@@ -406,34 +415,45 @@ class EODataset(Dataset):
         self, sample: Dict
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Process robot action chunks into a padded tensor.
+        Process robot action chunks — no zero-padding, original sizes.
 
-        Actions are continuous values, typically 7-dim (6-DOF + gripper).
+        EO-Data format:
+            action       : [num_chunks, steps_per_chunk, action_dim]
+                           e.g. (1, 16, 32) — may also be 1-D or 2-D
+            action_is_pad: optional mask indicating padded steps
+
         Returns:
-            actions     : FloatTensor [max_action_len, action_dim]
-            action_mask : LongTensor  [max_action_len]
+            actions     : FloatTensor [T, action_dim]  (actual timesteps)
+            action_mask : LongTensor  [T]              (1 = valid)
         """
         raw = sample.get("action")
 
-        actions = torch.zeros(self.cfg.max_action_len, self.cfg.action_dim)
-        action_mask = torch.zeros(self.cfg.max_action_len, dtype=torch.long)
-
         if raw is None:
-            return actions, action_mask
+            return torch.zeros(0, self.cfg.action_dim), torch.zeros(0, dtype=torch.long)
 
         arr = self._to_numpy(raw)
         if arr is None or arr.size == 0:
-            return actions, action_mask
+            return torch.zeros(0, self.cfg.action_dim), torch.zeros(0, dtype=torch.long)
 
-        # Support 1-D (single step) or 2-D (chunk)
-        if arr.ndim == 1:
+        # Flatten 3-D [num_chunks, steps, dim] → [total_steps, dim]
+        if arr.ndim == 3:
+            arr = arr.reshape(-1, arr.shape[-1])
+        elif arr.ndim == 1:
             arr = arr.reshape(1, -1)
 
-        T = min(arr.shape[0], self.cfg.max_action_len)
         D = min(arr.shape[1], self.cfg.action_dim)
+        actions = torch.tensor(arr[:, :D], dtype=torch.float32)    # [T, D]
+        action_mask = torch.ones(actions.shape[0], dtype=torch.long)
 
-        actions[:T, :D] = torch.tensor(arr[:T, :D], dtype=torch.float32)
-        action_mask[:T] = 1
+        # Honour action_is_pad if present
+        pad_flag = sample.get("action_is_pad")
+        if pad_flag is not None:
+            pad_arr = self._to_numpy(pad_flag)
+            if pad_arr is not None:
+                pad_arr = pad_arr.flatten()[: actions.shape[0]]
+                for i, p in enumerate(pad_arr):
+                    if p:
+                        action_mask[i] = 0
 
         return actions, action_mask
 
@@ -441,27 +461,30 @@ class EODataset(Dataset):
     def _process_states(
         self, sample: Dict
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Process robot proprioceptive state."""
+        """
+        Process robot proprioceptive state — no zero-padding, original sizes.
+
+        Returns:
+            states     : FloatTensor [T, state_dim]  (actual timesteps)
+            state_mask : LongTensor  [T]
+        """
         raw = sample.get("state")
 
-        states = torch.zeros(self.cfg.max_action_len, self.cfg.state_dim)
-        state_mask = torch.zeros(self.cfg.max_action_len, dtype=torch.long)
-
         if raw is None:
-            return states, state_mask
+            return torch.zeros(0, self.cfg.state_dim), torch.zeros(0, dtype=torch.long)
 
         arr = self._to_numpy(raw)
         if arr is None or arr.size == 0:
-            return states, state_mask
+            return torch.zeros(0, self.cfg.state_dim), torch.zeros(0, dtype=torch.long)
 
         if arr.ndim == 1:
             arr = arr.reshape(1, -1)
+        elif arr.ndim == 3:
+            arr = arr.reshape(-1, arr.shape[-1])
 
-        T = min(arr.shape[0], self.cfg.max_action_len)
         D = min(arr.shape[1], self.cfg.state_dim)
-
-        states[:T, :D] = torch.tensor(arr[:T, :D], dtype=torch.float32)
-        state_mask[:T] = 1
+        states = torch.tensor(arr[:, :D], dtype=torch.float32)
+        state_mask = torch.ones(states.shape[0], dtype=torch.long)
 
         return states, state_mask
 
@@ -486,8 +509,8 @@ class EODataset(Dataset):
 # ---------------------------------------------------------------------------
 def eo_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Custom collate that pads images to the same count per batch and
-    stacks everything else normally.
+    Custom collate that pads images, actions, and states to the
+    per-batch maximum (no fixed padding).
 
     Returns:
         images        : [B, max_N, 3, H, W]
@@ -495,42 +518,61 @@ def eo_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         input_ids     : [B, seq_len]
         attention_mask : [B, seq_len]
         labels        : [B, seq_len]
-        actions       : [B, T, action_dim]
-        action_mask   : [B, T]
-        states        : [B, T, state_dim]
-        state_mask    : [B, T]
+        actions       : [B, max_T_act, action_dim]
+        action_mask   : [B, max_T_act]
+        states        : [B, max_T_state, state_dim]
+        state_mask    : [B, max_T_state]
     """
+    B = len(batch)
+
+    # --- Images (variable count per sample) ---
     max_n_images = max(b["num_images"] for b in batch)
     C = batch[0]["images"].size(1)
     H = batch[0]["images"].size(2)
     W = batch[0]["images"].size(3) if batch[0]["images"].dim() == 4 else batch[0]["images"].size(2)
-
-    B = len(batch)
     padded_images = torch.zeros(B, max_n_images, C, H, W)
     image_mask = torch.zeros(B, max_n_images, dtype=torch.long)
+
+    # --- Actions (variable timesteps per sample) ---
+    action_dim = batch[0]["actions"].size(-1) if batch[0]["actions"].dim() == 2 else 0
+    max_t_act = max(b["actions"].size(0) for b in batch)
+    max_t_act = max(max_t_act, 1)  # at least 1 to avoid empty tensors
+    padded_actions = torch.zeros(B, max_t_act, action_dim)
+    padded_action_mask = torch.zeros(B, max_t_act, dtype=torch.long)
+
+    # --- States (variable timesteps per sample) ---
+    state_dim = batch[0]["states"].size(-1) if batch[0]["states"].dim() == 2 else 0
+    max_t_state = max(b["states"].size(0) for b in batch)
+    max_t_state = max(max_t_state, 1)
+    padded_states = torch.zeros(B, max_t_state, state_dim)
+    padded_state_mask = torch.zeros(B, max_t_state, dtype=torch.long)
 
     input_ids = []
     attention_masks = []
     labels_list = []
-    actions = []
-    action_masks = []
-    states = []
-    state_masks = []
-    sources = []
 
     for i, b in enumerate(batch):
+        # Images
         n = b["num_images"]
         padded_images[i, :n] = b["images"][:n]
         image_mask[i, :n] = 1
 
+        # Text
         input_ids.append(b["input_ids"])
         attention_masks.append(b["attention_mask"])
         labels_list.append(b["labels"])
-        actions.append(b["actions"])
-        action_masks.append(b["action_mask"])
-        states.append(b["states"])
-        state_masks.append(b["state_mask"])
-        sources.append(b["source"])
+
+        # Actions
+        t_act = b["actions"].size(0)
+        if t_act > 0:
+            padded_actions[i, :t_act] = b["actions"]
+            padded_action_mask[i, :t_act] = b["action_mask"]
+
+        # States
+        t_state = b["states"].size(0)
+        if t_state > 0:
+            padded_states[i, :t_state] = b["states"]
+            padded_state_mask[i, :t_state] = b["state_mask"]
 
     return {
         "images": padded_images,                          # [B, max_N, 3, H, W]
@@ -538,11 +580,10 @@ def eo_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "input_ids": torch.stack(input_ids),              # [B, seq_len]
         "attention_mask": torch.stack(attention_masks),    # [B, seq_len]
         "labels": torch.stack(labels_list),               # [B, seq_len]
-        "actions": torch.stack(actions),                  # [B, T, action_dim]
-        "action_mask": torch.stack(action_masks),         # [B, T]
-        "states": torch.stack(states),                    # [B, T, state_dim]
-        "state_mask": torch.stack(state_masks),           # [B, T]
-        "sources": sources,
+        "actions": padded_actions,                        # [B, max_T_act, action_dim]
+        "action_mask": padded_action_mask,                # [B, max_T_act]
+        "states": padded_states,                          # [B, max_T_state, state_dim]
+        "state_mask": padded_state_mask,                  # [B, max_T_state]
     }
 
 
@@ -558,8 +599,8 @@ def build_eo_dataloader(
     img_size: int = 224,
     max_seq_len: int = 512,
     max_action_len: int = 64,
-    action_dim: int = 7,
-    state_dim: int = 7,
+    action_dim: int = 32,
+    state_dim: int = 32,
     streaming: bool = False,
     cache_dir: Optional[str] = None,
     shuffle: bool = True,
