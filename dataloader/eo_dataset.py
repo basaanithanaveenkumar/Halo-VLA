@@ -75,12 +75,13 @@ class EODatasetConfig:
     subset: str = "interleave-temporal"
     split: str = "train"
     img_size: int = 224
-    max_seq_len: int = 512
+    max_seq_len: int = 77
     max_action_len: int = 64
     action_dim: int = 32   # EO-Data uses 32-dim actions (varies by embodiment)
     state_dim: int = 32
     max_images: int = 8  # max images per sample for interleaved data
     tokenizer_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    max_samples: Optional[int] = None   # limit dataset size (None = all)
     streaming: bool = False
     cache_dir: Optional[str] = None
     # Image normalisation (ImageNet defaults)
@@ -215,20 +216,76 @@ class EODataset(Dataset):
             streaming=self.cfg.streaming,
             cache_dir=self.cfg.cache_dir,
         )
+        # Optionally truncate to max_samples for fast iteration
+        if self.cfg.max_samples is not None and self.cfg.max_samples < len(self.dataset):
+            self.dataset = self.dataset.select(range(self.cfg.max_samples))
+            logger.info("Truncated to %d samples (--max_samples)", len(self.dataset))
+
         logger.info("Dataset loaded: %d samples", len(self.dataset))
+        logger.info("Building pair index (splitting multi-turn conversations)...")
+        self._build_index()
+
+    def _build_index(self):
+        """
+        Build a compact cumulative-sum array so we can map a virtual index
+        to (sample_idx, pair_idx) without storing a tuple per pair.
+
+        Only reads the lightweight ``conversation`` column — never loads
+        images, actions, or states — so it is fast and memory-efficient.
+        The stored array has one int32 entry per sample (≈125 KB for 31 K
+        samples) instead of a list of tuples.
+        """
+        import numpy as np
+
+        n_samples = len(self.dataset)
+        counts = np.empty(n_samples, dtype=np.int32)
+
+        # Access only the 'conversation' column for speed
+        for i in range(n_samples):
+            conv = self.dataset[i].get("conversation", [])
+            # Count user–assistant pairs by scanning roles
+            n_pairs = 0
+            j = 0
+            while j < len(conv):
+                role = conv[j].get("from", conv[j].get("role", "")).lower()
+                if role in ("human", "user") and j + 1 < len(conv):
+                    next_role = conv[j + 1].get("from", conv[j + 1].get("role", "")).lower()
+                    if next_role not in ("human", "user"):
+                        n_pairs += 1
+                        j += 2
+                        continue
+                j += 1
+            counts[i] = max(n_pairs, 1)  # at least 1 item per sample
+
+        self._cum_pairs = np.cumsum(counts)          # [n_samples]
+        self._total_items = int(self._cum_pairs[-1])
+
+        logger.info(
+            "Expanded to %d items (%d samples × avg %.1f pairs)",
+            self._total_items, n_samples,
+            self._total_items / max(n_samples, 1),
+        )
+
+    def _virtual_to_real(self, idx: int) -> Tuple[int, int]:
+        """Map a flat virtual index → (sample_idx, pair_idx) via binary search."""
+        import numpy as np
+        sample_idx = int(np.searchsorted(self._cum_pairs, idx, side="right"))
+        pair_idx = idx if sample_idx == 0 else idx - int(self._cum_pairs[sample_idx - 1])
+        return sample_idx, pair_idx
 
     # ---------------------------------------------------------- length / get
     def __len__(self) -> int:
-        return len(self.dataset)
+        return self._total_items
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        sample = self.dataset[idx]
+        sample_idx, pair_idx = self._virtual_to_real(idx)
+        sample = self.dataset[sample_idx]
 
         # ----- Images -----
         images = self._process_images(sample)
 
-        # ----- Conversation → token ids -----
-        input_ids, attention_mask, labels = self._process_conversation(sample)
+        # ----- Conversation → token ids (single user–assistant pair) -----
+        input_ids, attention_mask, labels = self._process_conversation(sample, pair_idx=pair_idx)
 
         # ----- Actions -----
         actions, action_mask = self._process_actions(sample)
@@ -246,6 +303,7 @@ class EODataset(Dataset):
             "states": states,                 # [T, state_dim]
             "state_mask": state_mask,          # [T]
             "num_images": images.size(0),
+            "pad_token_id": self.cfg.pad_token_id,
         }
 
     # ------------------------------------------------------------- images
@@ -297,42 +355,71 @@ class EODataset(Dataset):
         return torch.stack(imgs, dim=0)  # [N, 3, H, W]
 
     # ------------------------------------------------------- conversation
-    def _process_conversation(
-        self, sample: Dict
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _pair_conversations(self, sample: Dict) -> List[List[Dict]]:
         """
-        Flatten multi-turn conversation into a single token sequence.
+        Split a multi-turn conversation into individual (user, assistant) pairs.
 
-        Conversation format (HF):
-            [
-                {"from": "human", "value": "<image>\nWhat is happening?"},
-                {"from": "gpt",   "value": "The robot is picking up ..."},
-                ...
-            ]
-
-        Returns:
-            input_ids      : LongTensor [max_seq_len]
-            attention_mask  : LongTensor [max_seq_len]
-            labels          : LongTensor [max_seq_len]  (-100 for human turns)
+        Each pair is returned as a list of two dicts so that a single HF sample
+        with N user–assistant exchanges produces N independent training items,
+        each containing exactly one user question and one assistant response.
         """
         conversation = sample.get("conversation", [])
-        if not conversation:
+        pairs: List[List[Dict]] = []
+        i = 0
+        while i < len(conversation):
+            turn = conversation[i]
+            role = turn.get("from", turn.get("role", "human")).lower()
+            if role in ("human", "user"):
+                # Grab the following assistant turn if it exists
+                if i + 1 < len(conversation):
+                    next_turn = conversation[i + 1]
+                    next_role = next_turn.get("from", next_turn.get("role", "")).lower()
+                    if next_role not in ("human", "user"):
+                        pairs.append([turn, next_turn])
+                        i += 2
+                        continue
+                # No matching assistant turn — skip lone user turn
+                i += 1
+            else:
+                i += 1
+        return pairs if pairs else [[]]
+
+    def _process_conversation(
+        self, sample: Dict, pair_idx: int = 0
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Build a token sequence for a single (system + user + assistant) triple.
+
+        Args:
+            sample:   Raw HF sample dict.
+            pair_idx: Which user–assistant pair to use (0-indexed).
+
+        Returns:
+            input_ids      : LongTensor [seq_len]
+            attention_mask  : LongTensor [seq_len]
+            labels          : LongTensor [seq_len]  (-100 for non-assistant tokens)
+        """
+        pairs = self._pair_conversations(sample)
+        if not pairs or not pairs[0]:
             return self._empty_text()
+
+        pair_idx = min(pair_idx, len(pairs) - 1)
+        pair = pairs[pair_idx]
 
         text_parts: List[str] = []
         role_is_assistant: List[bool] = []
 
-        # Prepend system prompt from config
+        # 1. System prompt
         from config import HaloVLMConfig
         model_cfg = HaloVLMConfig()
         system_msg = f"{self.cfg.system_prefix}{model_cfg.system_prompt}{self.cfg.turn_end}"
         text_parts.append(system_msg)
-        role_is_assistant.append(False)  # mask system turn from loss
+        role_is_assistant.append(False)
 
-        for turn in conversation:
+        # 2. One user turn + one assistant turn
+        for turn in pair:
             role = turn.get("from", turn.get("role", "human")).lower()
             value = turn.get("value", turn.get("content", ""))
-
             if role in ("human", "user"):
                 text_parts.append(f"{self.cfg.human_prefix}{value}{self.cfg.turn_end}")
                 role_is_assistant.append(False)
@@ -342,12 +429,12 @@ class EODataset(Dataset):
 
         full_text = "".join(text_parts)
 
-        # Tokenise
+        # Tokenise — no padding here; collate pads to per-batch max
         encoding = self.tokenizer(
             full_text,
             max_length=self.cfg.max_seq_len,
             truncation=True,
-            padding="max_length",
+            padding=False,
             return_tensors="pt",
         )
         input_ids = encoding["input_ids"].squeeze(0)             # [seq_len]
@@ -404,10 +491,10 @@ class EODataset(Dataset):
         return labels
 
     def _empty_text(self):
-        """Return padded empty tensors when no conversation is present."""
-        ids = torch.full((self.cfg.max_seq_len,), self.cfg.pad_token_id, dtype=torch.long)
-        mask = torch.zeros(self.cfg.max_seq_len, dtype=torch.long)
-        labels = torch.full((self.cfg.max_seq_len,), -100, dtype=torch.long)
+        """Return minimal empty tensors when no conversation is present."""
+        ids = torch.full((1,), self.cfg.pad_token_id, dtype=torch.long)
+        mask = torch.zeros(1, dtype=torch.long)
+        labels = torch.full((1,), -100, dtype=torch.long)
         return ids, mask, labels
 
     # --------------------------------------------------------- actions
@@ -574,12 +661,24 @@ def eo_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             padded_states[i, :t_state] = b["states"]
             padded_state_mask[i, :t_state] = b["state_mask"]
 
+    # --- Text (dynamic padding to per-batch max) ---
+    pad_token_id = batch[0].get("pad_token_id", 0)
+    max_text_len = max(ids.size(0) for ids in input_ids)
+    padded_input_ids = torch.full((B, max_text_len), pad_token_id, dtype=torch.long)
+    padded_attention_mask = torch.zeros(B, max_text_len, dtype=torch.long)
+    padded_labels = torch.full((B, max_text_len), -100, dtype=torch.long)
+    for i in range(B):
+        L = input_ids[i].size(0)
+        padded_input_ids[i, :L] = input_ids[i]
+        padded_attention_mask[i, :L] = attention_masks[i]
+        padded_labels[i, :L] = labels_list[i]
+
     return {
         "images": padded_images,                          # [B, max_N, 3, H, W]
         "image_mask": image_mask,                         # [B, max_N]
-        "input_ids": torch.stack(input_ids),              # [B, seq_len]
-        "attention_mask": torch.stack(attention_masks),    # [B, seq_len]
-        "labels": torch.stack(labels_list),               # [B, seq_len]
+        "input_ids": padded_input_ids,                    # [B, max_text_len]
+        "attention_mask": padded_attention_mask,           # [B, max_text_len]
+        "labels": padded_labels,                          # [B, max_text_len]
         "actions": padded_actions,                        # [B, max_T_act, action_dim]
         "action_mask": padded_action_mask,                # [B, max_T_act]
         "states": padded_states,                          # [B, max_T_state, state_dim]
@@ -635,6 +734,7 @@ def build_eo_dataloader(
         state_dim=state_dim,
         streaming=streaming,
         cache_dir=cache_dir,
+        max_samples=kwargs.pop("max_samples", None),
     )
 
     dataset = EODataset(config=cfg, tokenizer=tokenizer, **kwargs)

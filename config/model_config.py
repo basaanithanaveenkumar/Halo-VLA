@@ -35,8 +35,8 @@ class HaloVLMConfig:
 
     # Decoder transformer
     dec_num_layers: int = 12
-    dec_num_heads: int = 32
-    dec_mlp_dim: int = 1024
+    dec_num_heads: int = 16
+    dec_mlp_dim: int = 512
     dec_drop: float = 0.0
 
     # MoE (DeepseekMoE) — used inside each TransformerBlock
@@ -47,7 +47,7 @@ class HaloVLMConfig:
     moe_num_shared_experts: int = 2
 
     # Positional embeddings
-    max_position_embeddings: int = 5000
+    max_position_embeddings: int = 2000
 
     # Image projector
     proj_vision_dim: int | None = None   # defaults to emb_dim

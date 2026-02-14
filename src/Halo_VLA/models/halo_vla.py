@@ -161,6 +161,7 @@ class HaloVLM(nn.Module):
         # ------------------------------------------------------------------ #
         # 7. DECODER TRANSFORMER — causal self-attention + MoE FFN.
         # ------------------------------------------------------------------ #
+        print(f"[HaloVLM] Sequence length to decoder: {combined_embeds.size(1)}")
         transformer_out = self.decoder_transformer(combined_embeds)
         transformer_out = self.layer_norm(transformer_out)
 
