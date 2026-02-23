@@ -1,6 +1,6 @@
 {
     "image_token": "<image>",
-    "action_token": "<action>",
+    "action_token": "<halo_action>",
     "state_token": "<state>",
     "token_ids": {
         "image_token_id": 151665,

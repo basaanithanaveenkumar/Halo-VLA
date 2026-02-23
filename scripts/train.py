@@ -7,8 +7,6 @@ Usage:
 """
 
 import argparse
-import logging
-import os
 import sys
 import time
 from pathlib import Path
@@ -26,8 +24,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src" / "Halo_VLA"))
 
-import numpy as np
-
 from config import HaloVLMConfig
 from models.halo_vla import HaloVLM
 from dataloader.eo_dataset import build_eo_dataloader
@@ -35,18 +31,10 @@ from utils import log_module_parameters
 from scripts.visualize import (
     create_video,
     unnormalise_image,
-    action_comparison_image,
-    extract_question_answer,
-    simple_match,
     generate_text,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +77,7 @@ def compute_action_loss(action_preds, action_targets, action_mask):
         action_mask:    [B, max_T]  (1 for real, 0 for pad)
     """
     if action_preds is None:
-        return torch.tensor(0.0)
+        return torch.tensor(0.0, device=action_targets.device)
 
     # Flatten chunk dimension: [B, n_act * chunk_size, action_dim]
     B, n_act, chunk, dim = action_preds.shape
@@ -103,8 +91,8 @@ def compute_action_loss(action_preds, action_targets, action_mask):
 
     if mask.sum() == 0:
         return torch.tensor(0.0, device=preds_flat.device)
-    # l2 loss
-    loss = ((preds_flat - targets) ** 2 * mask).sum() / mask.sum() / dim
+    # l1 loss
+    loss = ((preds_flat - targets).abs() * mask).sum() / mask.sum() / dim
     return loss
 
 
@@ -170,7 +158,6 @@ def generate_training_videos(
 
         # --- Decode GT question / answer from input_ids + labels ---
         ids_b = input_ids[b].cpu()
-        lbl_b = labels[b].cpu()
         full_decoded = tokenizer.decode(ids_b, skip_special_tokens=False)
 
         # Extract question (user turn) and GT answer (assistant turn)
@@ -187,7 +174,7 @@ def generate_training_videos(
                 gt_answer = asst_block.strip()
 
         # Clean up special tokens from question text
-        for tok in ["<image>", "<state>", "<action>"]:
+        for tok in ["<image>", "<state>", "<halo_action>"]:
             question = question.replace(tok, "").strip()
 
         # --- Convert images to BGR frames ---
@@ -224,10 +211,10 @@ def generate_training_videos(
 
             if act_preds is not None:
                 pred_actions_np = (
-                    act_preds[0].view(-1, act_preds.size(-1)).cpu().numpy()
+                    act_preds[0, 0].cpu().numpy()
                 )
         except Exception as e:
-            logger.warning("Vis generation failed for sample %d: %s", b, e)
+            logger.warning("Vis generation failed for sample {}: {}", b, e)
 
         # --- Create video ---
         video_path = str(vis_dir / f"sample_{b}_step{global_step}.mp4")
@@ -246,7 +233,7 @@ def generate_training_videos(
 
     model.train()
     logger.info(
-        "Generated %d visualisation video(s) at step %d → %s",
+        "Generated {} visualisation video(s) at step {} → {}",
         written, global_step, vis_dir,
     )
 
@@ -256,7 +243,7 @@ def generate_training_videos(
 # ---------------------------------------------------------------------------
 def train(args):
     device = torch.device(args.device)
-    logger.info("Device: %s", device)
+    logger.info("Device: {}", device)
 
     # ---- Config ----
     config = HaloVLMConfig(
@@ -282,7 +269,7 @@ def train(args):
         shuffle=True,
         max_samples=args.max_samples,
     )
-    logger.info("Dataset size: %d  |  Batches: %d", len(train_loader.dataset), len(train_loader))
+    logger.info("Dataset size: {}  |  Batches: {}", len(train_loader.dataset), len(train_loader))
 
     # ---- Grab tokenizer from dataset for debug decoding ----
     tokenizer = train_loader.dataset.tokenizer
@@ -326,17 +313,18 @@ def train(args):
                 decoded_text = tokenizer.decode(ids_cpu, skip_special_tokens=False)
                 logger.info(
                     "=== Debug (sample 0) ===\n"
-                    "  Total tokens : %d\n"
-                    "  Real tokens  : %d  (attention_mask=1)\n"
-                    "  Pad tokens   : %d  (attention_mask=0)\n"
-                    "  pad_token_id=%d count: %d\n"
-                    "  Decoded text:\n%s",
+                    "  Total tokens : {}\n"
+                    "  Real tokens  : {}  (attention_mask=1)\n"
+                    "  Pad tokens   : {}  (attention_mask=0)\n"
+                    "  pad_token_id={} count: {}\n"
+                    "  Decoded text:\n{}",
                     total_tokens, real_tokens, pad_tokens,
                     pad_id, pad_id_count, decoded_text,
                 )
 
-            # Forward
-            logits, action_preds = model(
+            # Forward  — returns (logits, action_hiddens)
+            # action_hiddens: [B, n_act, emb_dim] conditioning for flow decoder
+            logits, action_hiddens = model(
                 images=images,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -350,7 +338,8 @@ def train(args):
 
             # Losses
             lang_loss = compute_language_loss(logits, labels, num_prepended)
-            act_loss = compute_action_loss(action_preds, actions, action_mask)
+            # Flow matching loss — replaces MLP action MSE loss
+            act_loss = model.compute_flow_loss(action_hiddens, actions, action_mask)
             total_loss = lang_loss + args.action_loss_weight * act_loss
 
             # Backward
@@ -370,7 +359,7 @@ def train(args):
             if step % args.log_every == 0:
                 lr = optimizer.param_groups[0]["lr"]
                 logger.info(
-                    "Epoch %d | Step %d/%d | lang=%.4f  act=%.4f  total=%.4f | lr=%.2e",
+                    "Epoch {} | Step {}/{} | lang={:.4f}  act={:.4f}  total={:.4f} | lr={:.2e}",
                     epoch, step, len(train_loader),
                     lang_loss.item(), act_loss.item(), total_loss.item(), lr,
                 )
@@ -394,7 +383,7 @@ def train(args):
         n = len(train_loader)
         elapsed = time.time() - t0
         logger.info(
-            "=== Epoch %d done in %.1fs | avg lang=%.4f  act=%.4f  total=%.4f ===",
+            "=== Epoch {} done in {:.1f}s | avg lang={:.4f}  act={:.4f}  total={:.4f} ===",
             epoch, elapsed,
             epoch_lang_loss / n, epoch_act_loss / n, epoch_total_loss / n,
         )
@@ -413,7 +402,7 @@ def train(args):
                 },
                 ckpt_path,
             )
-            logger.info("Saved checkpoint → %s", ckpt_path)
+            logger.info("Saved checkpoint → {}", ckpt_path)
 
     logger.info("Training complete.")
 
@@ -427,12 +416,12 @@ def parse_args():
     # Data
     p.add_argument("--subset", default="interleave-temporal")
     p.add_argument("--batch_size", type=int, default=2)
-    p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--max_seq_len", type=int, default=512)
     p.add_argument("--action_dim", type=int, default=32)
     p.add_argument("--state_dim", type=int, default=32)
-    p.add_argument("--action_chunk_size", type=int, default=1)
-    p.add_argument("--max_samples", type=int, default=100,
+    p.add_argument("--action_chunk_size", type=int, default=16)
+    p.add_argument("--max_samples", type=int, default=2000,
                     help="Limit dataset to N samples for fast loading (None = all)")
 
     # Training

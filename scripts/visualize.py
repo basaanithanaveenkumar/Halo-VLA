@@ -23,7 +23,6 @@ Usage:
 """
 
 import argparse
-import logging
 import sys
 import textwrap
 from pathlib import Path
@@ -43,12 +42,7 @@ sys.path.insert(0, str(ROOT / "src" / "Halo_VLA"))
 from config import HaloVLMConfig
 from dataloader.eo_dataset import EODataset, EODatasetConfig
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +77,7 @@ def load_model(ckpt_path: str, device: torch.device):
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     logger.info(
-        "Loaded checkpoint %s  (epoch %d)", ckpt_path, ckpt.get("epoch", -1)
+        "Loaded checkpoint {}  (epoch {})", ckpt_path, ckpt.get("epoch", -1)
     )
     return model, config
 
@@ -97,7 +91,7 @@ def generate_text(model, tokenizer, images, input_ids, attention_mask, states,
     original_len = input_ids.size(1)  # save to decode only new tokens
 
     for _ in range(max_new_tokens):
-        logits, act = model(
+        logits, action_hiddens = model(
             images=images, input_ids=input_ids,
             attention_mask=attention_mask, states=states,
         )
@@ -110,6 +104,11 @@ def generate_text(model, tokenizer, images, input_ids, attention_mask, states,
             [attention_mask, torch.ones(1, 1, dtype=torch.long, device=device)],
             dim=1,
         )
+        # Sample actions from flow decoder at inference time
+        if action_hiddens is not None:
+            act = model.sample_actions(action_hiddens)
+        else:
+            act = None
         if act is not None:
             action_preds = act
 
@@ -183,7 +182,7 @@ def draw_text_overlay(frame: np.ndarray, lines: List[Tuple[str, Tuple[int, int, 
 
     y = y_start
     for text, colour in lines:
-        cv2.putText(frame, text, (8, y), cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.putText(frame, text, (8, y), cv2.FONT_HERSHEY_DUPLEX,
                     font_scale, colour, thickness, cv2.LINE_AA)
         y += line_gap
 
@@ -194,51 +193,119 @@ def action_comparison_image(pred: Optional[np.ndarray],
                             height: int = 200,
                             reveal_up_to: Optional[int] = None) -> np.ndarray:
     """
-    Render a matplotlib continuous-signal line plot comparing predicted vs GT
-    action dimensions.  Returns an HxW BGR numpy image.
+    Render predicted vs GT action trajectories on a dark-themed plot.
+
+    Each action dimension (e.g. x, y, z, roll, pitch, yaw, gripper) is
+    drawn in its own unique colour picked from a perceptual colour-map:
+      • GT  dimensions use the 'cool' spectrum  (blues → magentas)
+      • Pred dimensions use the 'autumn' spectrum (reds → yellows)
+    This makes it easy to visually match and compare individual DoFs
+    across the two trajectories.
 
     Args:
-        reveal_up_to: If set, only show the first N dimensions of the
-                      predicted action (for progressive animation).
-                      GT is always fully shown.
+        pred:  predicted actions [T_p, D] or [D] (may be None).
+        gt:    ground-truth actions [T_g, D] or [D].
+        reveal_up_to: number of predicted **timesteps** to reveal
+                      (None = show all).  GT is always fully shown.
+
+    Returns an HxW BGR numpy image.
     """
     plt = _import_matplotlib()
-    fig, ax = plt.subplots(figsize=(width / 100, height / 100), dpi=100)
+    import matplotlib.cm as cm
 
-    n_dims = gt.shape[-1]
-    dims = np.arange(n_dims)
+    # Ensure 2-D [T, D]
+    if gt.ndim == 1:
+        gt = gt[np.newaxis, :]
+    if pred is not None and pred.ndim == 1:
+        pred = pred[np.newaxis, :]
 
-    # GT as a continuous signal (always fully visible)
-    ax.plot(dims, gt, color="#00cccc", linewidth=1.8, label="Ground Truth",
-            marker="o", markersize=2.5, alpha=0.9)
-    ax.fill_between(dims, gt, alpha=0.15, color="#00cccc")
+    n_gt_steps, n_dims = gt.shape
+    gt_t = np.arange(n_gt_steps)
 
-    if pred is not None:
-        if reveal_up_to is not None:
-            k = min(reveal_up_to, len(pred))
+    # ── Colour palettes ──────────────────────────────────────────────
+    # Pick evenly-spaced hues from two distinct colour-maps so that:
+    #   • Each dimension d gets its own recognisable colour.
+    #   • GT and prediction palettes are visually distinct families.
+    # 'cool' gives blues→pinks for GT;  'plasma' gives vivid purple→yellow for pred.
+    gt_cmap  = cm.get_cmap("cool",   n_dims)   # one colour per dimension
+    pred_cmap = cm.get_cmap("plasma", n_dims)   # vibrant purple→amber spectrum
+    # Pre-compute RGBA tuples for each dimension index
+    gt_colours   = [gt_cmap(d)   for d in range(n_dims)]
+    pred_colours = [pred_cmap(d) for d in range(n_dims)]
+
+    # --- Dark theme ---
+    with plt.rc_context({
+        "figure.facecolor": "#1a1a2e",
+        "axes.facecolor": "#16213e",
+        "axes.edgecolor": "#444466",
+        "axes.labelcolor": "#cccccc",
+        "xtick.color": "#999999",
+        "ytick.color": "#999999",
+        "text.color": "#dddddd",
+        "grid.color": "#2a2a4a",
+        "grid.alpha": 0.6,
+    }):
+        fig, ax = plt.subplots(figsize=(width / 100, height / 100), dpi=100)
+
+        # ── GT: each dimension in its own colour from the 'cool' spectrum ──
+        for d in range(n_dims):
+            colour = gt_colours[d]
+            # Bold line for each GT dimension so every DoF is visible
+            ax.plot(gt_t, gt[:, d], color=colour, linewidth=1.4,
+                    alpha=0.85,
+                    label=f"GT d{d}" if d < 8 else "_nolegend_")
+            # Light filled band per dimension to hint at the trajectory
+            if n_gt_steps > 1:
+                ax.fill_between(gt_t,
+                                gt[:, d] - 0.02 * (gt[:, d].max() - gt[:, d].min() + 1e-6),
+                                gt[:, d] + 0.02 * (gt[:, d].max() - gt[:, d].min() + 1e-6),
+                                color=colour, alpha=0.10)
+
+        # ── Predicted: each dimension in its own colour from 'autumn' ──
+        if pred is not None:
+            n_pred_steps = pred.shape[0]
+            pred_t = np.arange(n_pred_steps)
+            k = min(reveal_up_to, n_pred_steps) if reveal_up_to is not None else n_pred_steps
+
             if k > 0:
-                ax.plot(dims[:k], pred[:k], color="#ff6600", linewidth=1.8,
-                        label="Predicted", marker="s", markersize=2.5, alpha=0.9)
-                ax.fill_between(dims[:k], pred[:k], alpha=0.15, color="#ff6600")
-        else:
-            ax.plot(dims, pred, color="#ff6600", linewidth=1.8,
-                    label="Predicted", marker="s", markersize=2.5, alpha=0.9)
-            ax.fill_between(dims, pred, alpha=0.15, color="#ff6600")
+                pred_slice = pred[:k, :]
+                pred_t_slice = pred_t[:k]
 
-    ax.set_xlabel("Action Dim", fontsize=7)
-    ax.set_ylabel("Value", fontsize=7)
-    ax.set_title("Action: Predicted vs Ground Truth", fontsize=8)
-    ax.legend(fontsize=6, loc="upper right")
-    ax.tick_params(labelsize=6)
-    ax.grid(True, alpha=0.25, linewidth=0.5)
-    fig.tight_layout(pad=0.5)
+                for d in range(min(n_dims, pred_slice.shape[1])):
+                    colour = pred_colours[d]
+                    # Dashed line distinguishes prediction from GT at a glance
+                    ax.plot(pred_t_slice, pred_slice[:, d],
+                            color=colour, linewidth=1.4, alpha=0.90,
+                            linestyle="--",
+                            label=f"Pred d{d}" if d < 8 else "_nolegend_")
 
-    # Render to numpy array
-    fig.canvas.draw()
-    w, h = fig.canvas.get_width_height()
-    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).copy()
-    buf = buf.reshape((h, w, 4))[:, :, :3]  # drop alpha → RGB
-    plt.close(fig)
+                    # Animated cursor dot at the latest revealed timestep
+                    if k < n_pred_steps:
+                        ax.plot(pred_t_slice[-1], pred_slice[-1, d], "o",
+                                color=colour, markersize=4, zorder=5,
+                                markeredgecolor="#fff", markeredgewidth=0.6)
+
+        # --- Styling ---
+        # Put the legend outside the axes so it doesn't occlude data
+        ax.legend(fontsize=5, loc="upper left",
+                  bbox_to_anchor=(1.01, 1.0),
+                  facecolor="#1a1a2e", edgecolor="#444466",
+                  labelcolor="#cccccc", framealpha=0.85,
+                  ncol=1, borderaxespad=0.2)
+        ax.set_xlabel("Timestep", fontsize=7)
+        ax.set_ylabel("Value", fontsize=7)
+        ax.set_title("Action Trajectory — GT (solid) vs Predicted (dashed)",
+                      fontsize=8, color="#eeeeee", pad=4)
+        ax.tick_params(labelsize=6)
+        ax.grid(True, linewidth=0.5)
+        fig.tight_layout(pad=0.4)
+
+        # Render to numpy array
+        fig.canvas.draw()
+        w, h = fig.canvas.get_width_height()
+        buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).copy()
+        buf = buf.reshape((h, w, 4))[:, :, :3]  # drop alpha → RGB
+        plt.close(fig)
 
     cv2 = _import_cv2()
     buf = cv2.cvtColor(buf, cv2.COLOR_RGB2BGR)
@@ -257,11 +324,11 @@ def create_video(
     gt_actions: Optional[np.ndarray],
     pred_actions: Optional[np.ndarray],
     output_path: str,
-    fps: int = 2,
+    fps: int = 3,
     frame_hold: int = 1,
     save_gif: bool = True,
-    token_reveal_fps: int = 4,
-    action_reveal_fps: int = 6,
+    token_reveal_fps: int = 5,
+    action_reveal_fps: int = 8,
 ):
     """
     Write a visualisation for a single sample with three animated phases.
@@ -283,21 +350,22 @@ def create_video(
     cv2 = _import_cv2()
 
     if not frames:
-        logger.warning("No frames to write for %s", output_path)
+        logger.warning("No frames to write for {}", output_path)
         return
 
     H, W = frames[0].shape[:2]
 
-    # ---- Action vectors (first timestep) for later animation ----
+    # ---- Action trajectories for EO1-style per-dim subplots ----
     has_actions = gt_actions is not None and gt_actions.size > 0
-    gt_act_vec, pred_act_vec = None, None
+    gt_act_traj, pred_act_traj = None, None
     if has_actions:
-        gt_act_vec = gt_actions[0] if gt_actions.ndim >= 2 else gt_actions
+        # Keep full [T, D] trajectory (or promote [D] → [1, D])
+        gt_act_traj = gt_actions if gt_actions.ndim >= 2 else gt_actions[np.newaxis, :]
         if pred_actions is not None and pred_actions.size > 0:
-            pred_act_vec = pred_actions[0] if pred_actions.ndim >= 2 else pred_actions
-            min_d = min(gt_act_vec.shape[-1], pred_act_vec.shape[-1])
-            gt_act_vec = gt_act_vec[:min_d]
-            pred_act_vec = pred_act_vec[:min_d]
+            pred_act_traj = pred_actions if pred_actions.ndim >= 2 else pred_actions[np.newaxis, :]
+            min_d = min(gt_act_traj.shape[-1], pred_act_traj.shape[-1])
+            gt_act_traj = gt_act_traj[:, :min_d]
+            pred_act_traj = pred_act_traj[:, :min_d]
 
     # Total canvas height (includes action chart area for phases 2-3)
     chart_h = 300 if has_actions else 0
@@ -306,7 +374,7 @@ def create_video(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, fps, (W, total_H))
     if not writer.isOpened():
-        logger.error("Cannot open video writer for %s", output_path)
+        logger.error("Cannot open video writer for {}", output_path)
         return
 
     is_correct = None
@@ -334,13 +402,13 @@ def create_video(
         for wl in wrap_text(f"GT: {gt_answer}", max_chars=70):
             lines.append((wl, (255, 204, 0)))  # BGR cyan-ish
 
-        draw_text_overlay(canvas, lines, alpha=0.6, y_start=20,
-                          line_gap=28, font_scale=0.6, thickness=2)
+        draw_text_overlay(canvas, lines, alpha=0.7, y_start=20,
+                          line_gap=26, font_scale=0.55, thickness=1)
 
-        # Show GT-only action chart during phase 1 (no predicted bars)
-        if chart_h > 0 and gt_act_vec is not None:
+        # Show GT-only action trajectory during phase 1
+        if chart_h > 0 and gt_act_traj is not None:
             chart = action_comparison_image(
-                None, gt_act_vec, width=W, height=chart_h,
+                None, gt_act_traj, width=W, height=chart_h,
             )
             combined = np.vstack([canvas, chart])
         elif chart_h > 0:
@@ -377,13 +445,13 @@ def create_video(
             for wl in wrap_text(label, max_chars=70):
                 lines.append((wl, colour))
 
-            draw_text_overlay(canvas, lines, alpha=0.6, y_start=20,
-                              line_gap=28, font_scale=0.6, thickness=2)
+            draw_text_overlay(canvas, lines, alpha=0.7, y_start=20,
+                              line_gap=26, font_scale=0.55, thickness=1)
 
-            # Show GT-only action chart during phase 2 (no predicted bars)
-            if chart_h > 0 and gt_act_vec is not None:
+            # Show GT-only action trajectory during phase 2
+            if chart_h > 0 and gt_act_traj is not None:
                 chart = action_comparison_image(
-                    None, gt_act_vec, width=W, height=chart_h,
+                    None, gt_act_traj, width=W, height=chart_h,
                 )
                 combined = np.vstack([canvas, chart])
             elif chart_h > 0:
@@ -396,47 +464,48 @@ def create_video(
             _write(combined, copies=1)
 
         # Hold the final prediction for a moment
-        if chart_h > 0 and gt_act_vec is not None:
+        if chart_h > 0 and gt_act_traj is not None:
             chart = action_comparison_image(
-                None, gt_act_vec, width=W, height=chart_h,
+                None, gt_act_traj, width=W, height=chart_h,
             )
             combined = np.vstack([canvas, chart])
         _write(combined, copies=max(fps, 1))
 
     # ==================================================================
-    # PHASE 3 — Animated action bar chart (dims revealed one by one)
+    # PHASE 3 — Animated action trajectory (predicted line drawn step-by-step)
     # ==================================================================
-    if has_actions and gt_act_vec is not None:
-        n_dims = gt_act_vec.shape[-1]
+    if has_actions and gt_act_traj is not None:
+        n_pred_steps = pred_act_traj.shape[0] if pred_act_traj is not None else 0
         # Build a static image canvas (last frame + full text)
         bg_canvas = frames[-1].copy()
         lines: List[Tuple[str, Tuple[int, int, int]]] = []
-        lines.append(("Action Prediction", (180, 180, 180)))
+        lines.append(("Action Trajectory", (180, 180, 180)))
         for wl in wrap_text(f"Q: {question}", max_chars=70):
             lines.append((wl, (255, 255, 255)))
         for wl in wrap_text(f"GT: {gt_answer}", max_chars=70):
             lines.append((wl, (255, 204, 0)))
         if pred_answer is not None:
-            colour = (0, 255, 128) if is_correct else (128, 0, 255)  # BGR bright green / magenta
+            colour = (0, 255, 128) if is_correct else (128, 0, 255)
             tag = "CORRECT" if is_correct else "WRONG"
             for wl in wrap_text(f"Pred [{tag}]: {pred_answer}", max_chars=70):
                 lines.append((wl, colour))
-        draw_text_overlay(bg_canvas, lines, alpha=0.6, y_start=20,
-                          line_gap=28, font_scale=0.6, thickness=2)
+        draw_text_overlay(bg_canvas, lines, alpha=0.7, y_start=20,
+                          line_gap=26, font_scale=0.55, thickness=1)
 
-        # Animate: reveal predicted dims strictly one at a time
-        for reveal in range(0, n_dims + 1):
+        # Animate: draw predicted trajectory one timestep at a time
+        n_anim = max(n_pred_steps, 1)
+        for reveal in range(0, n_anim + 1):
             chart = action_comparison_image(
-                pred_act_vec, gt_act_vec,
+                pred_act_traj, gt_act_traj,
                 width=W, height=chart_h,
-                reveal_up_to=reveal if pred_act_vec is not None else None,
+                reveal_up_to=reveal if pred_act_traj is not None else None,
             )
             combined = np.vstack([bg_canvas, chart])
             _write(combined, copies=1)
 
         # Hold the final chart
         final_chart = action_comparison_image(
-            pred_act_vec, gt_act_vec, width=W, height=chart_h,
+            pred_act_traj, gt_act_traj, width=W, height=chart_h,
         )
         final_combined = np.vstack([bg_canvas, final_chart])
         _write(final_combined, copies=max(fps * 2, 1))
@@ -473,9 +542,9 @@ def create_video(
                 duration=durations,
                 loop=0,
             )
-            logger.info("Saved GIF  → %s", gif_path)
+            logger.info("Saved GIF  → {}", gif_path)
 
-    logger.info("Saved video → %s  (%d phases, %dx%d)", output_path, 3, W, total_H)
+    logger.info("Saved video → {}  ({} phases, {}x{})", output_path, 3, W, total_H)
 
 
 # ---------------------------------------------------------------------------
@@ -527,7 +596,7 @@ def main(args):
     written = 0
 
     logger.info(
-        "Scanning %d samples for >= %d frames (max %d videos) …",
+        "Scanning {} samples for >= {} frames (max {} videos) …",
         n_total, args.min_frames, args.num_samples,
     )
 
@@ -617,7 +686,7 @@ def main(args):
         )
         written += 1
 
-    logger.info("Done — %d videos written to %s", written, out_dir)
+    logger.info("Done — {} videos written to {}", written, out_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -646,7 +715,7 @@ def parse_args():
 
     # Video
     p.add_argument("--output_dir", default="vis_out")
-    p.add_argument("--fps", type=int, default=2, help="Video FPS")
+    p.add_argument("--fps", type=int, default=3, help="Video FPS")
     p.add_argument("--frame_hold", type=int, default=2,
                     help="Seconds to hold each frame")
     p.add_argument("--canvas_w", type=int, default=728,

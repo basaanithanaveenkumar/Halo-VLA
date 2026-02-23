@@ -34,6 +34,7 @@ dependencies = [
     "tqdm>=4.65.0",
     "opencv-python>=4.13.0.92",
     "matplotlib>=3.10.8",
+    "loguru>=0.7.3",
 ]
 
 [project.optional-dependencies]

@@ -16,7 +16,6 @@ Reference: https://huggingface.co/datasets/IPEC-COMMUNITY/EO-Data1.5M
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -24,7 +23,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 # ---------------------------------------------------------------------------
 # Image token placeholder used inside conversation text
@@ -204,7 +203,7 @@ class EODataset(Dataset):
         from datasets import load_dataset
 
         logger.info(
-            "Loading %s / %s [%s] …",
+            "Loading {} / {} [{}] …",
             self.cfg.dataset_name,
             self.cfg.subset,
             self.cfg.split,
@@ -219,9 +218,9 @@ class EODataset(Dataset):
         # Optionally truncate to max_samples for fast iteration
         if self.cfg.max_samples is not None and self.cfg.max_samples < len(self.dataset):
             self.dataset = self.dataset.select(range(self.cfg.max_samples))
-            logger.info("Truncated to %d samples (--max_samples)", len(self.dataset))
+            logger.info("Truncated to {} samples (--max_samples)", len(self.dataset))
 
-        logger.info("Dataset loaded: %d samples", len(self.dataset))
+        logger.info("Dataset loaded: {} samples", len(self.dataset))
         logger.info("Building pair index (splitting multi-turn conversations)...")
         self._build_index()
 
@@ -261,7 +260,7 @@ class EODataset(Dataset):
         self._total_items = int(self._cum_pairs[-1])
 
         logger.info(
-            "Expanded to %d items (%d samples × avg %.1f pairs)",
+            "Expanded to {} items ({} samples × avg {:.1f} pairs)",
             self._total_items, n_samples,
             self._total_items / max(n_samples, 1),
         )
@@ -345,7 +344,7 @@ class EODataset(Dataset):
                 try:
                     img = Image.fromarray(np.uint8(item)).convert("RGB")
                 except Exception:
-                    logger.warning("Skipping unrecognised image format: %s", type(item))
+                    logger.warning("Skipping unrecognised image format: {}", type(item))
                     continue
             imgs.append(self.img_transform(img))
 
@@ -763,7 +762,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=0)
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO)
+    pass  # loguru auto-configures
 
     loader = build_eo_dataloader(
         subset=args.subset,

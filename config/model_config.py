@@ -56,7 +56,7 @@ class HaloVLMConfig:
     # Action decoder
     action_dim: int = 7                  # output dims (e.g. 6-DOF + gripper)
     action_hidden_dims: tuple[int, ...] = (512, 256)
-    action_chunk_size: int = 1           # predict N future steps at once
+    action_chunk_size: int = 16          # predict N future steps at once
     action_dropout: float = 0.1
     action_use_layernorm: bool = True
 
@@ -66,8 +66,13 @@ class HaloVLMConfig:
     state_dropout: float = 0.1
     state_use_layernorm: bool = True
 
+    # Flow matching action decoder
+    flow_hidden_dim: int = 1024          # hidden dim in flow velocity network
+    flow_time_embed_dim: int = 128       # dim of sinusoidal time embedding
+    flow_num_ode_steps: int = 20         # Euler integration steps at inference
+
     # System prompt
     system_prompt: str = (
         "You are a robotic VLA assistant. Given images and states, "
-        "describe observations or output <action> with a predicted trajectory."
+        "describe observations or output <halo_action> with a predicted trajectory."
     )

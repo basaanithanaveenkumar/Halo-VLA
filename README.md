@@ -110,14 +110,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Citation
-
-```bibtex
-@software{halo_vla_2026,
-  title = {Halo-VLA: Vision-Language Assistant},
-  author = {Your Name},
-  year = {2026},
-  url = {https://github.com/yourusername/halo-vla}
-}
-```

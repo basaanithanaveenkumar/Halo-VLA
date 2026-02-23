@@ -2,12 +2,11 @@
 Utility functions for counting and logging model parameters.
 """
 
-import logging
 from typing import Optional
 
 import torch.nn as nn
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 def count_parameters(module: nn.Module, trainable_only: bool = True) -> int:
@@ -20,7 +19,7 @@ def count_parameters(module: nn.Module, trainable_only: bool = True) -> int:
 def log_module_parameters(
     model: nn.Module,
     model_name: str = "Model",
-    logger_fn: Optional[logging.Logger] = None,
+    logger_fn = None,
 ) -> dict[str, dict[str, int]]:
     """
     Log parameter counts for each top-level sub-module of a model.
@@ -39,9 +38,9 @@ def log_module_parameters(
     trainable_all = count_parameters(model, trainable_only=True)
 
     log.info("=" * 60)
-    log.info("  %s — Parameter Summary", model_name)
+    log.info("  {} — Parameter Summary", model_name)
     log.info("=" * 60)
-    log.info("  %-30s %12s %12s", "Module", "Total", "Trainable")
+    log.info("  {:<30s} {:>12s} {:>12s}", "Module", "Total", "Trainable")
     log.info("-" * 60)
 
     stats: dict[str, dict[str, int]] = {}
@@ -51,7 +50,7 @@ def log_module_parameters(
         trainable = count_parameters(child, trainable_only=True)
         stats[name] = {"total": total, "trainable": trainable}
         log.info(
-            "  %-30s %10.2fM %10.2fM",
+            "  {:<30s} {:>10.2f}M {:>10.2f}M",
             name,
             total / 1e6,
             trainable / 1e6,
@@ -59,7 +58,7 @@ def log_module_parameters(
 
     log.info("-" * 60)
     log.info(
-        "  %-30s %10.2fM %10.2fM",
+        "  {:<30s} {:>10.2f}M {:>10.2f}M",
         "TOTAL",
         total_all / 1e6,
         trainable_all / 1e6,
